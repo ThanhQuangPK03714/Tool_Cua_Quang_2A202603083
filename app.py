@@ -93,12 +93,15 @@ from src.guideline_annotation import (
     SKELETON_POINT_GUIDANCE,
     STREET_LABELS,
     export_annotations,
+    load_face_regions,
     load_annotation_file,
     new_skeleton,
     save_annotation_file,
     validate_facial,
     validate_street,
 )
+from src.facial_landmark.preprocessing import assess_image_quality, make_preprocessing_variants
+from src.facial_landmark.annotation_state import merge_prediction_preserving_reviewed
 import src.facial_landmark.cvat as facial_cvat_module
 facial_cvat_module = _reload_changed_module(facial_cvat_module)
 FacialTaxonomyError = facial_cvat_module.FacialTaxonomyError
@@ -2647,8 +2650,12 @@ export default function (component) {
 """
 
 if hasattr(st.components, "v2"):
-    _CANVAS_COMPONENT = st.components.v2.component(
-        "local_annotation_canvas",
+    @st.cache_resource(show_spinner=False)
+    def _register_inline_component(name: str, *, html: str, css: str, js: str):
+        return st.components.v2.component(name, html=html, css=css, js=js)
+
+    _CANVAS_COMPONENT = _register_inline_component(
+        "local_annotation_canvas_" + hashlib.sha256(_CANVAS_JS.encode("utf-8")).hexdigest()[:10],
         html="""
         <div class="canvas-shell">
           <canvas id="annotation-canvas" aria-label="Ảnh để vẽ annotation"></canvas>
@@ -2708,6 +2715,7 @@ export default function (component) {
   const ctx = canvas.getContext("2d");
   const image = new Image();
   let shapes = Array.isArray(data.shapes) ? JSON.parse(JSON.stringify(data.shapes)) : [];
+  let faceRegions = Array.isArray(data.face_regions) ? JSON.parse(JSON.stringify(data.face_regions)) : [];
   let draft = [], dragStart = null, dragEnd = null, hover = null;
   let history = Array.isArray(data.history) ? data.history.slice() : [];
   let future = Array.isArray(data.future) ? data.future.slice() : [];
@@ -2716,17 +2724,29 @@ export default function (component) {
   const color = data.color || "#e45756";
   const visible = new Set(data.visible_labels || []);
   const spec = data.skeleton_spec || null;
+  const faceInstanceId = data.face_instance_id || "face-01";
+  const viewRoi = data.view_roi || null;
   const pointGuidance = Array.isArray(data.point_guidance) ? data.point_guidance : [];
   if (finish) finish.style.display = data.face_mode ? "none" : "inline-block";
+  function view() {
+    const x = viewRoi ? Math.max(0, Math.floor(viewRoi.x)) : 0;
+    const y = viewRoi ? Math.max(0, Math.floor(viewRoi.y)) : 0;
+    const width = viewRoi ? Math.min(image.naturalWidth-x, Math.ceil(viewRoi.width)) : image.naturalWidth;
+    const height = viewRoi ? Math.min(image.naturalHeight-y, Math.ceil(viewRoi.height)) : image.naturalHeight;
+    return {x, y, width: Math.max(1,width), height: Math.max(1,height)};
+  }
+  function screen(p) { const v=view(); return {x:p.x-v.x,y:p.y-v.y}; }
   function toPoint(event) {
     const r = canvas.getBoundingClientRect();
-    return {x: Math.max(0, Math.min(canvas.width - 1, (event.clientX-r.left)*canvas.width/r.width)),
-            y: Math.max(0, Math.min(canvas.height - 1, (event.clientY-r.top)*canvas.height/r.height))};
+    const v=view();
+    return {x: Math.max(v.x, Math.min(v.x+v.width-1, v.x+(event.clientX-r.left)*canvas.width/r.width)),
+            y: Math.max(v.y, Math.min(v.y+v.height-1, v.y+(event.clientY-r.top)*canvas.height/r.height))};
   }
   function line(points, stroke, close, fill) {
     if (!points || !points.length) return;
-    ctx.beginPath(); ctx.moveTo(points[0].x, points[0].y);
-    for (let i=1;i<points.length;i++) ctx.lineTo(points[i].x,points[i].y);
+    const shown=points.map(screen);
+    ctx.beginPath(); ctx.moveTo(shown[0].x, shown[0].y);
+    for (let i=1;i<shown.length;i++) ctx.lineTo(shown[i].x,shown[i].y);
     if (close && points.length>2) ctx.closePath();
     if (fill) { ctx.globalAlpha=.18; ctx.fillStyle=fill; ctx.fill(); ctx.globalAlpha=1; }
     ctx.strokeStyle=stroke; ctx.lineWidth=Math.max(2,canvas.width*.002); ctx.lineJoin="round"; ctx.stroke();
@@ -2745,42 +2765,60 @@ export default function (component) {
   }
   function render() {
     if (!image.complete || !image.naturalWidth) return;
-    if (canvas.width!==image.naturalWidth || canvas.height!==image.naturalHeight) {canvas.width=image.naturalWidth;canvas.height=image.naturalHeight;}
-    ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(image,0,0);
+    const v=view();
+    if (canvas.width!==v.width || canvas.height!==v.height) {canvas.width=v.width;canvas.height=v.height;}
+    ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(image,v.x,v.y,v.width,v.height,0,0,v.width,v.height);
+    for (const region of faceRegions) {
+      const p=screen({x:region.x,y:region.y});
+      ctx.strokeStyle=region.id===faceInstanceId?"#00e5ff":"#ffcc00";ctx.lineWidth=Math.max(2,canvas.width*.003);
+      ctx.strokeRect(p.x,p.y,region.width,region.height);
+      ctx.font="bold "+Math.max(13,canvas.width*.014)+"px sans-serif";ctx.fillStyle=ctx.strokeStyle;
+      ctx.fillText(region.id,p.x+4,Math.max(16,p.y-5));
+    }
     for (const s of shapes) {
       if (!visible.has(s.label)) continue;
       const pts=s.points||[], c=s.color||"#e45756";
       if (s.type==="skeleton") {
-        line(pts,c,s.contour==="closed",null);
+        const ordered=pts.slice().sort((a,b)=>a.id-b.id);
+        for(let i=1;i<ordered.length;i++)if(Number(ordered[i].id)===Number(ordered[i-1].id)+1)line([ordered[i-1],ordered[i]],c,false,null);
+        const expected=(data.skeleton_counts||{})[s.label];
+        if(s.contour==="closed"&&expected&&ordered.length===expected&&Number(ordered[ordered.length-1].id)-Number(ordered[0].id)===expected-1)line([ordered[ordered.length-1],ordered[0]],c,false,null);
         for (const p of pts) {
-          ctx.beginPath(); ctx.arc(p.x,p.y,Math.max(4,canvas.width*.004),0,Math.PI*2);
+          const shown=screen(p);
+          ctx.beginPath(); ctx.arc(shown.x,shown.y,Math.max(4,canvas.width*.004),0,Math.PI*2);
           ctx.fillStyle=p.state==="Outside"?"#888":p.state==="Occluded"?"#ffb000":c; ctx.fill();
           ctx.font="bold "+Math.max(12,canvas.width*.014)+"px sans-serif"; ctx.lineWidth=3;ctx.strokeStyle="#111";ctx.fillStyle="#fff";
-          ctx.strokeText(String(p.id),p.x+5,p.y-5);ctx.fillText(String(p.id),p.x+5,p.y-5);
+          ctx.strokeText(String(p.id),shown.x+5,shown.y-5);ctx.fillText(String(p.id),shown.x+5,shown.y-5);
         }
       } else {
         line(pts,c,s.type==="polygon",s.type==="polygon"?c:null);
         if (s.type==="rectangle" && pts.length>=3) line(pts,c,true,c);
-        if (pts[0]) {ctx.font="bold "+Math.max(13,canvas.width*.016)+"px sans-serif";ctx.lineWidth=3;ctx.strokeStyle="#111";ctx.fillStyle=c;ctx.strokeText(s.label,pts[0].x+4,Math.max(18,pts[0].y-7));ctx.fillText(s.label,pts[0].x+4,Math.max(18,pts[0].y-7));}
+        if (pts[0]) {const p0=screen(pts[0]);ctx.font="bold "+Math.max(13,canvas.width*.016)+"px sans-serif";ctx.lineWidth=3;ctx.strokeStyle="#111";ctx.fillStyle=c;ctx.strokeText(s.label,p0.x+4,Math.max(18,p0.y-7));ctx.fillText(s.label,p0.x+4,Math.max(18,p0.y-7));}
       }
     }
     if ((tool==="polygon"||tool==="polyline") && draft.length) { const p=draft.slice();if(hover)p.push(hover);line(p,color,false,null); }
-    if (tool==="rectangle" && dragStart && dragEnd) line([dragStart,{x:dragEnd.x,y:dragStart.y},dragEnd,{x:dragStart.x,y:dragEnd.y}],color,true,color);
-    if (remove) remove.textContent = tool==="keypoint" ? "Xóa skeleton đang chọn" : "Xóa annotation cuối";
+    if ((tool==="rectangle"||tool==="face_roi") && dragStart && dragEnd) line([dragStart,{x:dragEnd.x,y:dragStart.y},dragEnd,{x:dragStart.x,y:dragEnd.y}],tool==="face_roi"?"#00e5ff":color,true,tool==="face_roi"?"#00e5ff":color);
+    if (remove) remove.textContent = tool==="keypoint" ? "Xóa skeleton đang chọn" : tool==="face_roi" ? "Xóa vùng mặt đang chọn" : "Xóa annotation cuối";
     if (help) {
-      if (tool==="keypoint" && spec) {
-        const activeShape=shapes.find(s=>s.type==="skeleton"&&s.label===data.label);
-        const placed=(activeShape?.points||[]).length;
-        const pointId=spec.start+placed;
-        help.textContent=placed<spec.count
-          ? `Điểm tiếp theo ${pointId}: ${pointGuidance[placed]||"đặt theo guideline"}. Nhấp để đặt; Shift+kéo điểm đã đặt để chỉnh, kể cả khi cần đặt các điểm trùng nhau.`
+      if (tool==="face_roi") {
+        help.textContent="Kéo một hình chữ nhật quanh khuôn mặt; ảnh gốc và tọa độ landmark được giữ nguyên.";
+      } else if (tool==="keypoint" && spec) {
+        const activeShape=shapes.find(s=>s.type==="skeleton"&&s.label===data.label&&(s.face_instance_id||"face-01")===faceInstanceId);
+        const present=new Set((activeShape?.points||[]).map(point=>Number(point.id)));
+        let nextOffset=0;while(nextOffset<spec.count&&present.has(spec.start+nextOffset))nextOffset++;
+        const pointId=spec.start+nextOffset;
+        help.textContent=nextOffset<spec.count
+          ? `Điểm cần đặt ${pointId}: ${pointGuidance[nextOffset]||"đặt theo guideline"}. Nhấp để đặt; Shift+kéo điểm đã đặt để chỉnh.`
           : `${data.label}: đã đặt đủ ${spec.count} điểm. Kéo điểm trên canvas hoặc sửa trạng thái/tọa độ trong bảng.`;
-      } else {
+      } else if (tool==="rectangle") {
         help.textContent = tool==="rectangle" ? "Kéo để tạo box riêng cho object." : tool==="polyline" ? "Nhấp để đặt điểm; kết thúc đường mở bằng Hoàn tất." : "Nhấp để đặt vertex; hoàn tất polygon kín khi xong.";
+      } else {
+        help.textContent = tool==="polyline" ? "Nhấp để đặt điểm; kết thúc đường mở bằng Hoàn tất." : "Nhấp để đặt vertex; hoàn tất polygon kín khi xong.";
       }
     }
   }
-  function commit(next) { history.push(JSON.stringify(shapes)); if(history.length>60)history.shift();future=[];shapes=next;setStateValue("shapes",shapes);setStateValue("history",history);setStateValue("future",future);render(); }
+  function snapshot() { return JSON.stringify({shapes:shapes,face_regions:faceRegions}); }
+  function commit(next, nextRegions=faceRegions) { history.push(snapshot()); if(history.length>60)history.shift();future=[];shapes=next;faceRegions=nextRegions;setStateValue("shapes",shapes);setStateValue("face_regions",faceRegions);setStateValue("history",history);setStateValue("future",future);render(); }
   function finishGeometry() {
     if ((tool!=="polygon"&&tool!=="polyline") || draft.length<(tool==="polygon"?3:2)) return;
     if (tool==="polygon"&&polygonCrosses(draft)) { if(help)help.textContent="Polygon tự giao cắt; hãy chỉnh các vertex trước khi hoàn tất.";return; }
@@ -2791,36 +2829,40 @@ export default function (component) {
   canvas.onpointerdown=function(e){e.preventDefault();const p=toPoint(e);
     if(tool==="polygon"||tool==="polyline"){draft.push(p);hover=p;render();return;}
     if(tool==="keypoint"){
-      const active=shapes.find(s=>s.type==="skeleton"&&s.label===data.label);
-      const alreadyPlaced=(active?.points||[]).length;
-      const canPlace=!!spec&&alreadyPlaced<spec.count;
+      const active=shapes.find(s=>s.type==="skeleton"&&s.label===data.label&&(s.face_instance_id||"face-01")===faceInstanceId);
+      const present=new Set((active?.points||[]).map(point=>Number(point.id)));
+      let nextOffset=0;while(spec&&nextOffset<spec.count&&present.has(spec.start+nextOffset))nextOffset++;
+      const canPlace=!!spec&&nextOffset<spec.count;
       if(e.shiftKey||!canPlace){
         const radius=24*canvas.width/canvas.getBoundingClientRect().width;
         let nearest=null, distance=radius;
-        for(const shape of shapes) if(shape.type==="skeleton"&&shape.label===data.label&&visible.has(shape.label)) for(const point of (shape.points||[])){
+        for(const shape of shapes) if(shape.type==="skeleton"&&shape.label===data.label&&(shape.face_instance_id||"face-01")===faceInstanceId&&visible.has(shape.label)) for(const point of (shape.points||[])){
           const d=Math.hypot(point.x-p.x,point.y-p.y);if(d<distance){distance=d;nearest={label:shape.label,id:point.id};}
         }
         if(nearest){dragBefore=JSON.stringify(shapes);dragTarget=nearest;canvas.setPointerCapture(e.pointerId);return;}
       }
     }
-    if(tool==="keypoint"&&spec){let next=shapes.slice();let idx=next.findIndex(s=>s.type==="skeleton"&&s.label===data.label);
-      if(idx<0){next.push({...spec,type:"skeleton",label:data.label,color:color,points:[]});idx=next.length-1;}
-      const s=next[idx], n=(s.points||[]).length;
-      if(n<spec.count){s.points.push({id:spec.start+n,x:p.x,y:p.y,state:data.point_state||"Visible",source:data.point_source||"manual",review_status:"pending"});commit(next);} return;}
+    if(tool==="keypoint"&&spec){let next=shapes.slice();let idx=next.findIndex(s=>s.type==="skeleton"&&s.label===data.label&&(s.face_instance_id||"face-01")===faceInstanceId);
+      if(idx<0){next.push({...spec,type:"skeleton",label:data.label,color:color,face_instance_id:faceInstanceId,points:[]});idx=next.length-1;}
+      const s=next[idx], present=new Set((s.points||[]).map(point=>Number(point.id)));let offset=0;while(offset<spec.count&&present.has(spec.start+offset))offset++;
+      if(offset<spec.count){s.points.push({id:spec.start+offset,x:p.x,y:p.y,state:data.point_state||"Visible",source:data.point_source||"manual",review_status:"pending"});s.points.sort((a,b)=>a.id-b.id);commit(next);} return;}
     dragStart=p;dragEnd=p;canvas.setPointerCapture(e.pointerId);render();
   };
-  canvas.onpointermove=function(e){hover=toPoint(e);if(dragTarget){const pt=shapes.find(s=>s.label===dragTarget.label)?.points?.find(p=>p.id===dragTarget.id);if(pt){pt.x=hover.x;pt.y=hover.y;}}if(dragStart)dragEnd=hover;render();};
-  canvas.onpointerup=function(e){if(dragTarget){if(dragBefore){history.push(dragBefore);if(history.length>60)history.shift();future=[];setStateValue("shapes",shapes);setStateValue("history",history);setStateValue("future",future);}dragTarget=null;dragBefore=null;render();return;}if(tool!=="rectangle"||!dragStart)return;dragEnd=toPoint(e);
+  canvas.onpointermove=function(e){hover=toPoint(e);if(dragTarget){const pt=shapes.find(s=>s.label===dragTarget.label&&(s.face_instance_id||"face-01")===faceInstanceId)?.points?.find(p=>p.id===dragTarget.id);if(pt){pt.x=hover.x;pt.y=hover.y;pt.source="manual";pt.review_status="needs_review";}}if(dragStart)dragEnd=hover;render();};
+  canvas.onpointerup=function(e){if(dragTarget){if(dragBefore){history.push(dragBefore);if(history.length>60)history.shift();future=[];setStateValue("shapes",shapes);setStateValue("history",history);setStateValue("future",future);}dragTarget=null;dragBefore=null;render();return;}if(tool!=="rectangle"&&tool!=="face_roi"||!dragStart)return;dragEnd=toPoint(e);
     const l=Math.min(dragStart.x,dragEnd.x),r=Math.max(dragStart.x,dragEnd.x),t=Math.min(dragStart.y,dragEnd.y),b=Math.max(dragStart.y,dragEnd.y);
+    if(tool==="face_roi") {if(r-l>=8&&b-t>=8){let n=faceRegions.length+1;let id="face-"+String(n).padStart(2,"0");while(faceRegions.some(region=>region.id===id)){n++;id="face-"+String(n).padStart(2,"0");}const regionId=data.replace_face_region?faceInstanceId:id;const region={id:regionId,x:l,y:t,width:r-l,height:b-t};const nextRegions=data.replace_face_region?faceRegions.filter(item=>item.id!==regionId).concat([region]):faceRegions.concat([region]);commit(shapes,nextRegions);}dragStart=null;dragEnd=null;render();return;}
     if(r-l>=2&&b-t>=2)commit(shapes.concat([{type:"rectangle",label:data.label,color:color,occluded:!!data.occluded,truncated:!!data.truncated,points:[{x:l,y:t},{x:r,y:t},{x:r,y:b},{x:l,y:b}]}]));
     dragStart=null;dragEnd=null;render();};
   canvas.ondblclick=function(e){e.preventDefault();finishGeometry();};
   finish.onclick=finishGeometry;
-  undo.onclick=function(){if(draft.length){draft.pop();render();return;}if(history.length){future.push(JSON.stringify(shapes));shapes=JSON.parse(history.pop());setStateValue("shapes",shapes);setStateValue("history",history);setStateValue("future",future);render();}};
-  redo.onclick=function(){if(future.length){history.push(JSON.stringify(shapes));shapes=JSON.parse(future.pop());setStateValue("shapes",shapes);setStateValue("history",history);setStateValue("future",future);render();}};
+  function restore(raw){const state=JSON.parse(raw);if(Array.isArray(state)){shapes=state;}else{shapes=state.shapes||[];faceRegions=state.face_regions||[];}setStateValue("shapes",shapes);setStateValue("face_regions",faceRegions);}
+  undo.onclick=function(){if(draft.length){draft.pop();render();return;}if(history.length){future.push(snapshot());restore(history.pop());setStateValue("history",history);setStateValue("future",future);render();}};
+  redo.onclick=function(){if(future.length){history.push(snapshot());restore(future.pop());setStateValue("history",history);setStateValue("future",future);render();}};
   remove.onclick=function(){
     if(data.face_mode) {
-      if(tool==="keypoint") commit(shapes.filter(s=>!(s.type==="skeleton"&&s.label===data.label)));
+      if(tool==="keypoint") commit(shapes.filter(s=>!(s.type==="skeleton"&&s.label===data.label&&(s.face_instance_id||"face-01")===faceInstanceId)));
+      else if(tool==="face_roi"&&faceRegions.some(region=>region.id===faceInstanceId)) commit(shapes.filter(s=>(s.face_instance_id||"face-01")!==faceInstanceId),faceRegions.filter(region=>region.id!==faceInstanceId));
     }
     else if(shapes.length) commit(shapes.slice(0,-1));
   };
@@ -2829,8 +2871,8 @@ export default function (component) {
 """
 
 if hasattr(st.components, "v2"):
-    _GUIDELINE_CANVAS_COMPONENT = st.components.v2.component(
-        "guideline_annotation_canvas",
+    _GUIDELINE_CANVAS_COMPONENT = _register_inline_component(
+        "guideline_annotation_canvas_" + hashlib.sha256(_GUIDELINE_CANVAS_JS.encode("utf-8")).hexdigest()[:10],
         html="""
         <div class="canvas-shell">
           <canvas id="guideline-canvas" aria-label="Guideline annotation canvas"></canvas>
@@ -2976,36 +3018,96 @@ def render_guideline_canvas_workspace(mode: str) -> None:
     active_key = st.selectbox("Ảnh đang gán nhãn", list(record_map), format_func=lambda k: f"{record_map[k]['name']} ({record_map[k]['width']}×{record_map[k]['height']})", key=f"guideline_active_{mode}")
     record = record_map[active_key]
     image_state_key = f"guideline_{'face' if face_mode else 'street'}_{active_key}"
+    canvas_key = f"guideline_canvas_state_{mode}_{active_key}"
     storage = ROOT / "outputs" / "local_annotations" / ("facial" if face_mode else "street") / f"{active_key}.json"
     if image_state_key not in st.session_state:
         loaded = []
+        loaded_regions = []
         if storage.is_file():
             try:
-                payload = json.loads(storage.read_text(encoding="utf-8"))
+                raw_json = storage.read_bytes()
+                payload = json.loads(raw_json.decode("utf-8"))
                 if payload.get("image", {}).get("key") == active_key and payload.get("mode") == mode:
-                    loaded = payload.get("annotations", [])
+                    loaded = load_annotation_file(raw_json, record, mode)
+                    if face_mode:
+                        loaded_regions = load_face_regions(raw_json, record, mode)
                     st.session_state[f"{image_state_key}_issues"] = payload.get("issues", [])
-            except (OSError, json.JSONDecodeError):
+            except (OSError, ValueError, json.JSONDecodeError):
                 st.warning("Không đọc được annotation lưu trước đó; tệp vẫn được giữ nguyên.")
         st.session_state[image_state_key] = loaded
+        if face_mode:
+            st.session_state[f"{image_state_key}_face_regions"] = loaded_regions
     annotations = st.session_state[image_state_key]
     issue_key = f"{image_state_key}_issues"
     issues = st.session_state.setdefault(issue_key, [])
 
     if face_mode:
         labels = [spec["name"] for spec in SKELETONS]
+        regions_key = f"{image_state_key}_face_regions"
+        face_regions = st.session_state.setdefault(regions_key, [])
+        instance_options = [str(region["id"]) for region in face_regions] or ["face-01"]
+        instance_key = f"{image_state_key}_active_face"
+        if st.session_state.get(instance_key) not in instance_options:
+            st.session_state[instance_key] = instance_options[0]
+        active_instance_id = st.selectbox(
+            "Face Instance",
+            instance_options,
+            key=instance_key,
+            help="Mỗi vùng mặt lưu một bộ 7 skeleton riêng; không tạo tọa độ landmark tự động cho vùng này.",
+        )
+        canvas_action = st.segmented_control(
+            "Canvas tool",
+            options=["Đặt landmark", "Chọn vùng mặt"],
+            default="Đặt landmark",
+            key=f"{image_state_key}_canvas_action",
+        )
+        view_options = ["Ảnh gốc"] + (["Zoom vùng mặt"] if active_instance_id in instance_options and face_regions else [])
+        view_key = f"{image_state_key}_view_mode"
+        if st.session_state.get(view_key) not in view_options:
+            st.session_state[view_key] = view_options[0]
+        view_mode = st.segmented_control(
+            "Khung nhìn",
+            options=view_options,
+            default=view_options[0],
+            key=view_key,
+        )
+        selected_region = next((region for region in face_regions if str(region["id"]) == active_instance_id), None)
+        view_roi = selected_region if view_mode == "Zoom vùng mặt" and canvas_action != "Chọn vùng mặt" else None
+        if st.button("AI gợi ý điểm cho Face Instance", key=f"{image_state_key}_suggest_{active_instance_id}"):
+            try:
+                source_rgb = np.asarray(Image.open(io.BytesIO(record["data"])).convert("RGB"))
+                face_roi = None if selected_region is None else tuple(
+                    int(selected_region[key]) for key in ("x", "y", "width", "height")
+                )
+                proposed, ai_meta = facial_mp_module.propose_facial_landmark50(source_rgb, face_roi=face_roi)
+                st.session_state[f"{image_state_key}_ai_meta"] = ai_meta
+                if proposed:
+                    annotations[:] = merge_prediction_preserving_reviewed(annotations, proposed, active_instance_id)
+                    st.session_state[image_state_key] = annotations
+                    save_annotation_file(storage, record, mode, annotations, issues, face_regions=face_regions)
+                    st.rerun()
+                st.warning(ai_meta.get("warning", "AI không tạo được điểm; bạn vẫn có thể đặt landmark thủ công trên canvas."))
+            except Exception as exc:
+                logger.exception("Local facial suggestion failed image=%s instance=%s", record["name"], active_instance_id)
+                st.warning(f"AI không khả dụng: {type(exc).__name__}: {exc}. Bạn vẫn có thể vẽ thủ công trên canvas.")
+        local_ai_meta = st.session_state.get(f"{image_state_key}_ai_meta")
+        if local_ai_meta:
+            st.caption(
+                f"AI: {local_ai_meta.get('status')} · {local_ai_meta.get('model')} · "
+                f"biến thể {local_ai_meta.get('selected_variant', '—')} · "
+                f"{len(local_ai_meta.get('attempts', []))} lượt thử · review pending"
+            )
+            if local_ai_meta.get("warning"):
+                st.info(local_ai_meta["warning"])
         active_label = st.selectbox("Skeleton", labels, format_func=lambda name: f"{name} · ID {SKELETON_BY_NAME[name]['start']}–{SKELETON_BY_NAME[name]['start'] + SKELETON_BY_NAME[name]['count'] - 1}", key=f"{image_state_key}_skeleton")
-        tool = "keypoint"
+        tool = "face_roi" if canvas_action == "Chọn vùng mặt" else "keypoint"
         spec = SKELETON_BY_NAME[active_label]
         point_state = st.selectbox("Trạng thái điểm mới", POINT_STATES, key=f"{image_state_key}_new_state")
-        no_face = st.checkbox("Ảnh này không có mặt người lái", key=f"{image_state_key}_no_face")
-        if no_face and annotations:
-            st.warning("Ảnh đã có landmark; bỏ chọn tùy chọn này trước khi tiếp tục chỉnh sửa.")
         hidden_labels = st.multiselect("Ẩn skeleton trên canvas", labels, key=f"{image_state_key}_hidden")
         if active_label in hidden_labels:
             st.caption("Skeleton đang chọn luôn hiển thị để đặt và chỉnh đúng điểm; bỏ chọn nó khỏi danh sách ẩn nếu muốn giữ trạng thái hiển thị sau khi đổi skeleton.")
         visible_labels = [name for name in labels if name not in hidden_labels or name == active_label]
-        selected_idx = next((i for i, shape in enumerate(annotations) if shape.get("label") == active_label), None)
+        selected_idx = next((i for i, shape in enumerate(annotations) if shape.get("label") == active_label and str(shape.get("face_instance_id") or "face-01") == active_instance_id), None)
     else:
         labels = [label for group in STREET_LABELS.values() for label in group]
         active_label = st.selectbox("Nhãn", labels, key=f"{image_state_key}_label")
@@ -3038,37 +3140,111 @@ def render_guideline_canvas_workspace(mode: str) -> None:
             column_config = {"id": st.column_config.NumberColumn("Point ID", disabled=True), "x": st.column_config.NumberColumn("X", min_value=0.0, max_value=float(record["width"] - 1)), "y": st.column_config.NumberColumn("Y", min_value=0.0, max_value=float(record["height"] - 1))}
             if face_mode:
                 column_config["state"] = st.column_config.SelectboxColumn("State", options=list(POINT_STATES), required=True)
-            edited = st.data_editor(editor_rows, key=f"{image_state_key}_points_{selected_idx}", num_rows="fixed", hide_index=True, column_config=column_config)
+            editor_key = f"{image_state_key}_points_{active_instance_id}_{selected_idx}" if face_mode else f"{image_state_key}_points_{selected_idx}"
+            edited = st.data_editor(editor_rows, key=editor_key, num_rows="fixed", hide_index=True, column_config=column_config)
             edited_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else edited
             for p, row in zip(points, edited_rows):
+                changed = float(p["x"]) != float(row["x"]) or float(p["y"]) != float(row["y"])
+                if face_mode:
+                    changed = changed or p.get("state", "Visible") != row["state"]
                 p["x"], p["y"] = float(row["x"]), float(row["y"])
                 if face_mode:
                     p["state"] = row["state"]
+                    if changed:
+                        p["source"], p["review_status"] = "manual", "needs_review"
+            if face_mode:
+                point_ids = sorted(int(point["id"]) for point in points)
+                delete_point_id = st.selectbox(
+                    "Point ID cần xóa",
+                    point_ids,
+                    key=f"{image_state_key}_delete_point_select_{active_instance_id}_{selected_idx}",
+                )
+                if st.button("Xóa landmark đã chọn", key=f"{image_state_key}_delete_point_{active_instance_id}_{selected_idx}"):
+                    component_state = st.session_state.get(canvas_key, {})
+                    history = component_state.get("history", []) if isinstance(component_state, dict) else []
+                    history.append(json.dumps({"shapes": annotations, "face_regions": face_regions}, ensure_ascii=False))
+                    component_state = dict(component_state) if isinstance(component_state, dict) else {}
+                    component_state["history"], component_state["future"] = history[-60:], []
+                    st.session_state[canvas_key] = component_state
+                    selected["points"] = [point for point in points if int(point["id"]) != int(delete_point_id)]
+                    st.rerun()
         if st.button("Xóa annotation đang chọn", key=f"{image_state_key}_delete_{selected_idx}"):
+            component_state = st.session_state.get(f"guideline_canvas_state_{mode}_{active_key}", {})
+            history = component_state.get("history", []) if isinstance(component_state, dict) else []
+            history.append(json.dumps({"shapes": annotations, "face_regions": face_regions if face_mode else []}, ensure_ascii=False))
+            component_state = dict(component_state) if isinstance(component_state, dict) else {}
+            component_state["history"], component_state["future"] = history[-60:], []
+            st.session_state[f"guideline_canvas_state_{mode}_{active_key}"] = component_state
             annotations.pop(selected_idx)
             st.rerun()
 
     if face_mode:
-        counts = {s["name"]: len(next((a.get("points", []) for a in annotations if a.get("label") == s["name"]), [])) for s in SKELETONS}
-        visible_count = sum(p.get("state") == "Visible" for a in annotations for p in a.get("points", []))
-        occluded_count = sum(p.get("state") == "Occluded" for a in annotations for p in a.get("points", []))
-        outside_count = sum(p.get("state") == "Outside" for a in annotations for p in a.get("points", []))
+        instance_shapes = [shape for shape in annotations if str(shape.get("face_instance_id") or "face-01") == active_instance_id]
+        counts = {s["name"]: len(next((a.get("points", []) for a in instance_shapes if a.get("label") == s["name"]), [])) for s in SKELETONS}
+        visible_count = sum(p.get("state") == "Visible" for a in instance_shapes for p in a.get("points", []))
+        occluded_count = sum(p.get("state") == "Occluded" for a in instance_shapes for p in a.get("points", []))
+        outside_count = sum(p.get("state") == "Outside" for a in instance_shapes for p in a.get("points", []))
         complete = sum(counts.values())
-        st.caption(f"Tiến độ {complete}/50 điểm · Visible {visible_count} · Occluded {occluded_count} · Outside {outside_count} · thiếu {50-complete}")
-        selected_visible = sum(point.get("state") == "Visible" for shape in annotations if shape.get("label") == active_label for point in shape.get("points", []))
+        all_points = sum(len(shape.get("points", [])) for shape in annotations)
+        st.caption(f"{active_instance_id}: {complete}/50 điểm · Visible {visible_count} · Occluded {occluded_count} · Outside {outside_count} · thiếu {50-complete}. Toàn ảnh: {all_points}/{50 * max(1, len(face_regions))} điểm qua {max(1, len(face_regions))} Face Instance.")
+        selected_visible = sum(point.get("state") == "Visible" for shape in instance_shapes if shape.get("label") == active_label for point in shape.get("points", []))
         minimum = int(spec["minimum_visible"])
         st.caption(f"{active_label}: đang thấy {selected_visible}/{spec['count']} điểm; ngưỡng guideline {minimum}/{spec['count']}. Dưới ngưỡng, chỉ hoàn tất điểm nếu còn bằng chứng; nếu không, đặt cả skeleton Outside.")
-        active_shape = next((shape for shape in annotations if shape.get("label") == active_label), None)
+        active_shape = next((shape for shape in instance_shapes if shape.get("label") == active_label), None)
         placed_count = len(active_shape.get("points", [])) if active_shape else 0
         if placed_count < spec["count"]:
-            next_id = spec["start"] + placed_count
-            st.info(f"Điểm tiếp theo · ID {next_id}: {SKELETON_POINT_GUIDANCE[active_label][placed_count]}. Đặt theo đúng thứ tự Point ID; trái/phải tính theo phía trên ảnh.")
+            present_ids = {int(point["id"]) for point in (active_shape or {}).get("points", [])}
+            next_offset = next(index for index in range(spec["count"]) if spec["start"] + index not in present_ids)
+            next_id = spec["start"] + next_offset
+            st.info(f"Điểm cần đặt · ID {next_id}: {SKELETON_POINT_GUIDANCE[active_label][next_offset]}. Trái/phải tính theo phía trên ảnh.")
     else:
         st.caption(f"{len(annotations)} annotation · {len(records)} ảnh trong batch")
 
-    canvas_key = f"guideline_canvas_state_{mode}_{active_key}"
     saved_component_state = st.session_state.get(canvas_key, {})
-    image_src = "data:image/png;base64," + base64.b64encode(record["data"]).decode("ascii")
+    canvas_bytes = record["data"]
+    if face_mode:
+        with st.expander("Chất lượng ảnh và tiền xử lý", expanded=False):
+            source_rgb = np.asarray(Image.open(io.BytesIO(record["data"])).convert("RGB"))
+            quality = assess_image_quality(source_rgb)
+            st.write(
+                f"Kích thước {quality['width']}×{quality['height']} · sáng {quality['brightness']}/255 · "
+                f"tương phản {quality['contrast']} · blur score {quality['blur_score']} · "
+                f"nhiễu ước lượng {quality['noise_estimate']}"
+            )
+            st.caption("Điều kiện gợi ý: " + ", ".join(quality["tags"]) + ". Ảnh grayscale không đồng nghĩa chắc chắn là ảnh hồng ngoại.")
+            q1, q2, q3 = st.columns(3)
+            with q1:
+                use_clahe = st.checkbox("Tạo biến thể CLAHE", value=("low_contrast" in quality["tags"] or "underexposed" in quality["tags"]), key=f"{image_state_key}_clahe")
+                clip_limit = st.slider("CLAHE clip limit", 1.0, 4.0, 2.0, 0.1, key=f"{image_state_key}_clahe_clip")
+                tile_size = st.select_slider("CLAHE tile size", options=[4, 6, 8, 12, 16], value=8, key=f"{image_state_key}_clahe_tile")
+            with q2:
+                use_gamma = st.checkbox("Tạo biến thể gamma", value=("low_light" in quality["tags"]), key=f"{image_state_key}_gamma_on")
+                gamma = st.slider("Gamma", 0.6, 2.2, 1.25, 0.05, key=f"{image_state_key}_gamma")
+            with q3:
+                use_denoise = st.checkbox("Tạo biến thể khử nhiễu", value=("high_noise" in quality["tags"]), key=f"{image_state_key}_denoise")
+                denoise_strength = st.slider("Mức bilateral", 1, 12, 5, key=f"{image_state_key}_denoise_strength")
+            variants, _ = make_preprocessing_variants(
+                source_rgb,
+                clahe_enabled=use_clahe,
+                gamma_values=(gamma,),
+                gamma_enabled=use_gamma,
+                denoise_enabled=use_denoise,
+                clip_limit=clip_limit,
+                tile_grid_size=tile_size,
+                denoise_strength=denoise_strength,
+            )
+            preview_name = st.selectbox("Ảnh hiển thị trên canvas", list(variants), key=f"{image_state_key}_variant")
+            original_col, preview_col = st.columns(2)
+            with original_col:
+                st.image(source_rgb, caption="Ảnh gốc · nguồn tọa độ", alt="Ảnh gốc người lái")
+            with preview_col:
+                st.image(variants[preview_name], caption=f"Canvas · {preview_name}", alt=f"Ảnh tiền xử lý {preview_name}")
+            if preview_name != "Original":
+                enhanced = Image.fromarray(variants[preview_name])
+                enhanced_buffer = io.BytesIO()
+                enhanced.save(enhanced_buffer, format="PNG", optimize=True)
+                canvas_bytes = enhanced_buffer.getvalue()
+    image_src = "data:image/png;base64," + base64.b64encode(canvas_bytes).decode("ascii")
     guideline_shapes = []
     for i, shape in enumerate(annotations):
         copy = dict(shape)
@@ -3077,13 +3253,17 @@ def render_guideline_canvas_workspace(mode: str) -> None:
     if isinstance(saved_component_state, dict):
         # Python-side edits (coordinates, states, or attributes) are the source
         # of truth when the component is mounted again.
-        st.session_state[canvas_key] = {**saved_component_state, "shapes": guideline_shapes}
+        st.session_state[canvas_key] = {**saved_component_state, "shapes": guideline_shapes, "face_regions": face_regions if face_mode else []}
     result = _GUIDELINE_CANVAS_COMPONENT(
         key=canvas_key,
-        data={"image_src": image_src, "shapes": guideline_shapes, "tool": ("inspect" if face_mode and no_face else tool), "label": active_label,
+        data={"image_src": image_src, "shapes": guideline_shapes, "tool": tool, "label": active_label,
               "color": _canvas_label_color(active_label, labels), "visible_labels": visible_labels,
               "face_mode": face_mode,
+              "face_regions": face_regions if face_mode else [],
+              "face_instance_id": active_instance_id if face_mode else None,
+              "view_roi": view_roi if face_mode else None,
               "skeleton_spec": ({"start": spec["start"], "count": spec["count"], "contour": spec["contour"]} if spec else None),
+              "skeleton_counts": {item["name"]: item["count"] for item in SKELETONS} if face_mode else {},
               "point_guidance": SKELETON_POINT_GUIDANCE.get(active_label, []) if face_mode else [],
               "point_state": point_state,
               "occluded": bool(next_occluded) if not face_mode and tool == "rectangle" else False,
@@ -3091,20 +3271,24 @@ def render_guideline_canvas_workspace(mode: str) -> None:
               "history": saved_component_state.get("history", []) if isinstance(saved_component_state, dict) else [],
               "future": saved_component_state.get("future", []) if isinstance(saved_component_state, dict) else []},
         width="stretch", on_shapes_change=lambda: None,
+        on_face_regions_change=lambda: None,
         on_history_change=lambda: None, on_future_change=lambda: None,
     )
     updated = getattr(result, "shapes", None)
     if isinstance(updated, list):
         annotations[:] = updated
+    if face_mode:
+        updated_regions = getattr(result, "face_regions", None)
+        if isinstance(updated_regions, list):
+            face_regions[:] = updated_regions
+            st.session_state[regions_key] = face_regions
     if not face_mode and tool == "rectangle":
         for shape in annotations:
             if shape.get("type") == "rectangle" and shape.get("label") == active_label:
                 shape.setdefault("occluded", bool(next_occluded)); shape.setdefault("truncated", bool(next_truncated))
 
-    if face_mode and not no_face:
+    if face_mode:
         validation = validate_facial(annotations, record["width"], record["height"])
-    elif face_mode:
-        validation = [] if not annotations else ["Remove landmarks or mark this image as containing a face."]
     else:
         validation = validate_street(annotations, record["width"], record["height"])
     if validation:
@@ -3124,8 +3308,10 @@ def render_guideline_canvas_workspace(mode: str) -> None:
             if st.button("Xóa", key=f"{image_state_key}_issue_delete_{n}"):
                 issues.pop(n); st.rerun()
 
-    save_annotation_file(storage, record, mode, annotations, issues)
+    save_annotation_file(storage, record, mode, annotations, issues, face_regions=face_regions if face_mode else None)
     archive = {"schema_version": 1, "mode": mode, "image": {"key": active_key, "name": record["name"], "width": record["width"], "height": record["height"]}, "annotations": export_annotations(annotations), "issues": issues}
+    if face_mode:
+        archive["face_regions"] = face_regions
     c1, c2 = st.columns(2)
     with c1:
         st.download_button("Xuất annotation JSON", data=json.dumps(archive, ensure_ascii=False, indent=2).encode("utf-8"), file_name=f"{Path(record['name']).stem}_annotations.json", mime="application/json", key=f"{image_state_key}_download")
@@ -3139,6 +3325,9 @@ def render_guideline_canvas_workspace(mode: str) -> None:
                 imported_issues = imported_payload.get("issues", [])
                 if isinstance(imported_issues, list):
                     issues[:] = imported_issues
+                if face_mode:
+                    face_regions[:] = load_face_regions(imported_bytes, record, mode)
+                    st.session_state[regions_key] = face_regions
                 st.rerun()
             except (ValueError, json.JSONDecodeError) as exc:
                 st.error(f"Không thể nạp tệp: {exc}")
@@ -3192,36 +3381,56 @@ def render_cvat_facial_workspace(ctx: Dict[str, Any], client: CVATClient) -> Non
     }
     storage = ROOT / "outputs" / "local_annotations" / "cvat_facial" / str(ctx["job_id"]) / f"frame_{frame_number_value}.json"
     state_key = f"{image_key}_annotations"
+    regions_key = f"{state_key}_face_regions"
     if state_key not in st.session_state:
         if storage.is_file():
             try:
-                st.session_state[state_key] = load_annotation_file(storage.read_bytes(), record, "Facial Landmark-50")
+                stored_bytes = storage.read_bytes()
+                st.session_state[state_key] = load_annotation_file(stored_bytes, record, "Facial Landmark-50")
+                st.session_state[regions_key] = load_face_regions(stored_bytes, record, "Facial Landmark-50")
             except (OSError, ValueError, json.JSONDecodeError):
                 st.warning("Không khôi phục được bản nháp cục bộ; tệp gốc được giữ nguyên.")
                 st.session_state[state_key] = []
+                st.session_state[regions_key] = []
         else:
             st.session_state[state_key] = []
+            st.session_state[regions_key] = []
     annotations = st.session_state[state_key]
+    face_regions = st.session_state.setdefault(regions_key, [])
     for shape in annotations:
         for point in shape.get("points", []):
             point.setdefault("source", "manual")
             point.setdefault("review_status", "pending")
 
     ai_meta_key = f"{state_key}_ai_metadata"
-    st.info("Bấm chạy AI sẽ tạo lại đề xuất và thay bản nháp hiện tại của frame này nếu phát hiện được mặt.")
+    canvas_action = st.segmented_control(
+        "Canvas tool", options=["Đặt landmark", "Chọn vùng mặt"], default="Đặt landmark",
+        key=f"{image_key}_canvas_action",
+    )
+    view_options = ["Ảnh gốc"] + (["Zoom vùng mặt"] if face_regions else [])
+    view_key = f"{image_key}_view_mode"
+    if st.session_state.get(view_key) not in view_options:
+        st.session_state[view_key] = view_options[0]
+    view_mode = st.segmented_control("Khung nhìn", options=view_options, default=view_options[0], key=view_key)
+    selected_region = face_regions[0] if face_regions else None
+    view_roi = selected_region if selected_region and view_mode == "Zoom vùng mặt" and canvas_action != "Chọn vùng mặt" else None
+    st.info("AI thử ảnh gốc, tăng kích thước và một số biến thể phù hợp. Điểm thủ công/đã duyệt được giữ; canvas vẫn dùng được nếu detect thất bại.")
     if st.button("AI tự gán 50 điểm cho frame", type="primary", key=f"{image_key}_auto_label"):
         try:
             with st.spinner("MediaPipe đang phát hiện mặt và đề xuất 50 landmark…"):
                 proposed, ai_meta = facial_mp_module.propose_facial_landmark50(
                     np.asarray(image.convert("RGB")),
+                    face_roi=None if selected_region is None else tuple(
+                        int(selected_region[key]) for key in ("x", "y", "width", "height")
+                    ),
                 )
+            st.session_state[ai_meta_key] = ai_meta
             if not proposed:
-                st.warning("Không phát hiện được mặt trong frame này; không ghi annotation.")
+                st.warning("Không tự động phát hiện được mặt. Bạn vẫn có thể tự chọn vùng mặt và tiếp tục gán landmark.")
             else:
-                annotations[:] = proposed
+                annotations[:] = merge_prediction_preserving_reviewed(annotations, proposed, "face-01")
                 st.session_state[state_key] = annotations
-                st.session_state[ai_meta_key] = ai_meta
-                save_annotation_file(storage, record, "Facial Landmark-50", annotations)
+                save_annotation_file(storage, record, "Facial Landmark-50", annotations, face_regions=face_regions)
                 st.rerun()
         except Exception as exc:
             logger.exception(
@@ -3269,12 +3478,31 @@ def render_cvat_facial_workspace(ctx: Dict[str, Any], client: CVATClient) -> Non
             "y": st.column_config.NumberColumn("Y", min_value=0.0, max_value=float(image.height - 1)),
             "state": st.column_config.SelectboxColumn("Visibility", options=list(POINT_STATES), required=True),
             "source": st.column_config.TextColumn("Source", disabled=True),
-            "review_status": st.column_config.SelectboxColumn("Review", options=["pending", "reviewed", "accepted"], required=True),
+            "review_status": st.column_config.SelectboxColumn("Review", options=["pending", "needs_review", "reviewed", "accepted", "saved"], required=True),
         }
         edited = st.data_editor(editor_rows, key=f"{image_key}_points_{selected_idx}", num_rows="fixed", hide_index=True, column_config=config)
         rows = edited.to_dict("records") if hasattr(edited, "to_dict") else edited
         for point, row in zip(points, rows):
-            point["x"], point["y"], point["state"], point["review_status"] = float(row["x"]), float(row["y"]), row["state"], row["review_status"]
+            changed = (float(point["x"]) != float(row["x"]) or float(point["y"]) != float(row["y"]) or point.get("state", "Visible") != row["state"])
+            point["x"], point["y"], point["state"], point["review_status"] = float(row["x"]), float(row["y"]), row["state"], ("needs_review" if changed else row["review_status"])
+            if changed:
+                point["source"] = "manual"
+    if selected_idx is not None and annotations[selected_idx].get("points"):
+        selected_points = annotations[selected_idx]["points"]
+        delete_point_id = st.selectbox(
+            "Point ID cần xóa", sorted(int(point["id"]) for point in selected_points),
+            key=f"{image_key}_delete_point_select_{selected_idx}",
+        )
+        if st.button("Xóa landmark đã chọn", key=f"{image_key}_delete_point_{selected_idx}"):
+            component_state = st.session_state.get(f"cvat_face_canvas_{ctx['job_id']}_{frame_number_value}", {})
+            history = component_state.get("history", []) if isinstance(component_state, dict) else []
+            history.append(json.dumps({"shapes": annotations, "face_regions": face_regions}, ensure_ascii=False))
+            component_state = dict(component_state) if isinstance(component_state, dict) else {}
+            component_state["history"] = history[-60:]
+            component_state["future"] = []
+            st.session_state[f"cvat_face_canvas_{ctx['job_id']}_{frame_number_value}"] = component_state
+            annotations[selected_idx]["points"] = [point for point in selected_points if int(point["id"]) != int(delete_point_id)]
+            st.rerun()
     if selected_idx is not None and st.button("Xóa skeleton đang chọn", key=f"{image_key}_delete_{selected_idx}"):
         annotations.pop(selected_idx)
         st.rerun()
@@ -3283,10 +3511,11 @@ def render_cvat_facial_workspace(ctx: Dict[str, Any], client: CVATClient) -> Non
     states = {state: sum(point.get("state") == state for shape in annotations for point in shape.get("points", [])) for state in POINT_STATES}
     st.caption(f"Tiến độ {complete}/50 · Visible {states['Visible']} · Occluded {states['Occluded']} · Outside {states['Outside']}")
     active_shape = next((shape for shape in annotations if shape.get("label") == active_label), None)
-    point_index = len(active_shape.get("points", [])) if active_shape else 0
+    existing_ids = {int(point["id"]) for point in (active_shape or {}).get("points", [])}
+    point_index = next((offset for offset in range(spec["count"]) if spec["start"] + offset not in existing_ids), spec["count"])
     if point_index < spec["count"]:
         next_id = spec["start"] + point_index
-        st.info(f"Điểm kế tiếp · ID {next_id}: {SKELETON_POINT_GUIDANCE[active_label][point_index]}")
+        st.info(f"Điểm cần đặt · ID {next_id}: {SKELETON_POINT_GUIDANCE[active_label][point_index]}")
 
     canvas_key = f"cvat_face_canvas_{ctx['job_id']}_{frame_number_value}"
     saved_component_state = st.session_state.get(canvas_key, {})
@@ -3296,25 +3525,34 @@ def render_cvat_facial_workspace(ctx: Dict[str, Any], client: CVATClient) -> Non
         rendered["color"] = _canvas_label_color(str(shape.get("label", "")), [item["name"] for item in SKELETONS])
         canvas_shapes.append(rendered)
     if isinstance(saved_component_state, dict):
-        st.session_state[canvas_key] = {**saved_component_state, "shapes": canvas_shapes}
+        st.session_state[canvas_key] = {**saved_component_state, "shapes": canvas_shapes, "face_regions": face_regions}
     result = _GUIDELINE_CANVAS_COMPONENT(
         key=canvas_key,
         data={
-            "image_src": image_src, "shapes": canvas_shapes, "tool": "keypoint",
+            "image_src": image_src, "shapes": canvas_shapes, "tool": ("face_roi" if canvas_action == "Chọn vùng mặt" else "keypoint"),
             "label": active_label, "color": _canvas_label_color(active_label, [item["name"] for item in SKELETONS]),
             "visible_labels": visible_labels,
+            "face_regions": face_regions,
+            "face_instance_id": "face-01",
+            "view_roi": view_roi,
+            "replace_face_region": True,
             "skeleton_spec": {"start": spec["start"], "count": spec["count"], "contour": spec["contour"]},
+            "skeleton_counts": {item["name"]: item["count"] for item in SKELETONS},
             "point_guidance": SKELETON_POINT_GUIDANCE[active_label], "point_state": point_state,
             "face_mode": True,
             "history": saved_component_state.get("history", []),
             "future": saved_component_state.get("future", []),
         },
-        width="stretch", on_shapes_change=lambda: None,
+        width="stretch", on_shapes_change=lambda: None, on_face_regions_change=lambda: None,
         on_history_change=lambda: None, on_future_change=lambda: None,
     )
     updated = getattr(result, "shapes", None)
     if isinstance(updated, list):
         annotations[:] = updated
+    updated_regions = getattr(result, "face_regions", None)
+    if isinstance(updated_regions, list):
+        face_regions[:] = updated_regions
+        st.session_state[regions_key] = face_regions
     draft_validation = validate_facial(annotations, image.width, image.height, allow_incomplete=True)
     final_validation = validate_facial(annotations, image.width, image.height)
     if draft_validation:
@@ -3332,12 +3570,12 @@ def render_cvat_facial_workspace(ctx: Dict[str, Any], client: CVATClient) -> Non
                 point["review_status"] = "accepted"
         st.rerun()
 
-    save_annotation_file(storage, record, "Facial Landmark-50", annotations)
+    save_annotation_file(storage, record, "Facial Landmark-50", annotations, face_regions=face_regions)
     st.download_button(
         "Tải bản nháp JSON", data=storage.read_bytes(), file_name=f"frame_{frame_number_value}_facial_landmark50.json",
         mime="application/json", key=f"{image_key}_download",
     )
-    all_accepted = not final_validation and all(point.get("review_status") == "accepted" for shape in annotations for point in shape.get("points", []))
+    all_accepted = not final_validation and all(point.get("review_status") in {"accepted", "saved"} for shape in annotations for point in shape.get("points", []))
     if not final_validation and not all_accepted:
         st.info("Duyệt trạng thái Review của từng điểm hoặc dùng **Accept All** trước khi lưu lên CVAT.")
     confirmed = st.checkbox(
@@ -3356,7 +3594,9 @@ def render_cvat_facial_workspace(ctx: Dict[str, Any], client: CVATClient) -> Non
             )
             for shape in annotations:
                 shape["cvat_group"] = result_info["group"]
-            save_annotation_file(storage, record, "Facial Landmark-50", annotations)
+                for point in shape.get("points", []):
+                    point["review_status"] = "saved"
+            save_annotation_file(storage, record, "Facial Landmark-50", annotations, face_regions=face_regions)
             st.success(f"Đã {('thêm' if result_info['added'] else 'cập nhật')} 7 skeleton và đọc lại xác nhận từ CVAT (group {result_info['group']}).")
             st.rerun()
         except Exception as exc:

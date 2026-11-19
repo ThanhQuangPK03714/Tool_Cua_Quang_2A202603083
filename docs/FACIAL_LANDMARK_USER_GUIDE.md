@@ -1,30 +1,37 @@
 # Facial Landmark-50 User Guide
 
-## Connected CVAT workflow
+## Canvas local: manual first, AI optional
 
-1. Connect and load the Task/Job whose labels are the seven Facial Landmark-50 skeleton groups.
-2. Select **Facial Landmark-50 · CVAT Job** in the workflow. This route bypasses all segmentation inference.
-3. Resolve CVAT preflight errors. Each parent label must be a Skeleton with the guideline's point count and child names that explicitly encode Point IDs. SVG edges are checked when CVAT returns them; missing/invalid SVG produces a warning and uses the guideline topology in the app.
-4. Choose a frame and click **AI tự gán 50 điểm cho frame**. MediaPipe detects the largest face and creates a review-pending proposal. If several faces are detected, confirm that the largest one is the driver.
-5. Review the 50 coordinates and visibility states. Use **Accept All** after checking, confirm the exact Job/frame write, then click **Save to CVAT**. The app adds or updates the seven skeletons in one face group, preserves unrelated annotations, and reads the result back.
+1. Start the app, choose **Canvas local**, then **Facial Landmark-50**.
+2. Upload the original image. The original dimensions are used for every saved point.
+3. In **Canvas tool**, choose **Chọn vùng mặt**, then drag a rectangle around a face. Draw another rectangle to add another local Face Instance.
+4. Select the Face Instance. Choose **Zoom vùng mặt** to work on its crop; the canvas converts clicks and drags back to the full source-image coordinates.
+5. Choose **Đặt landmark**, select the skeleton and point state, and click to place the next missing Point ID. Select a point in the table to delete it; the ID stays missing and can be placed again. Dragging, table edits, and point deletion mark the point for review.
+6. Use the Canvas **Undo/Redo** buttons for point/ROI edits. The JSON draft stores the 7 skeleton groups, source image metadata, face ROIs, point state, source and review status.
+7. Use **Chất lượng ảnh và tiền xử lý** to inspect brightness, contrast, blur/noise signals and optional CLAHE/gamma/bilateral previews. Enhanced variants keep the original size, so clicks remain in source-image coordinates.
+8. Click **AI gợi ý điểm cho Face Instance** only when you want a proposal. It tries MediaPipe on the image or selected face ROI, plus conservative size/preprocessing fallbacks. It keeps manual and accepted points. If it fails, continue placing points manually.
+9. Review validation and export the local annotation JSON. Local drafts do not write to CVAT.
 
-The current connected workspace handles one driver face per frame. It does not yet load arbitrary existing CVAT face groups into the editor or edit several faces in one frame. If SVG is unavailable through the API, the app can still save mapped child points, but CVAT may not draw connecting edges for that Task. Face Landmarker does not return per-point visibility states or confidence; AI suggestions stay pending review.
+Grayscale appearance is only a visual tag; the app does not assert that the camera is infrared. The enhancement preview does not prove that a variant produces more accurate landmarks.
 
-## Local manual workflow
+## Connected CVAT Job
 
-1. Start the app with `streamlit run app.py`.
-2. In the sidebar choose **Canvas local**.
-3. Choose **Facial Landmark-50** and upload the source image.
-4. Select one of the seven skeleton groups. Place points in the displayed Point ID order and follow the anatomical cue shown above and below the canvas.
-5. Select the state for new points. Edit coordinates/states in the point table; use Shift-drag to adjust an already placed point while a group is incomplete.
-6. Review the topology/validation messages and export the local annotation JSON.
+1. Connect to the Task/Job with the seven configured skeleton parents and matching Point ID children.
+2. Resolve taxonomy preflight errors. SVG edges are checked when available; missing SVG produces a warning rather than blocking manual canvas use.
+3. Choose a frame. Optionally select **Chọn vùng mặt** and draw a manual ROI; use **Zoom vùng mặt** for point placement.
+4. Click **AI tự gán 50 điểm cho frame** to request a suggestion. A failed face detection shows a message and leaves manual drawing available. AI refreshes pending AI-generated points and preserves manual/accepted points.
+5. Review coordinates and point visibility. Manual edits are marked `needs_review`; use **Accept All** after review.
+6. Confirm the exact Job/frame and click **Save to CVAT**. The app validates taxonomy, writes only the selected group's skeleton data, and reads back the result. This live flow was not verified against a server during the current development run.
 
-The app's local mode remains a local draft workflow. To write directly to CVAT, connect and load the CVAT Task/Job, then use the connected workspace above.
+The connected workspace still handles one Face Instance per frame. Local Canvas supports multiple instances in its JSON drafts, but this is not converted to multiple CVAT face groups yet.
 
-## CVAT task requirements
+## Sample images
 
-CVAT skeleton structure must be configured when creating the task/project. The app preflight verifies parent type, child counts, Point IDs encoded in child names, and SVG connections. The current repository has no access to the user's live Job, so that Task's actual taxonomy has not been verified.
+Copy the six original files to `tests/fixtures/facial_landmark/driver_monitoring/` using the names listed in that directory's README. Do not replace them with generated images. Until the originals are available, real-image inference, enhancement and manual-canvas results remain unverified.
 
-## AI status
+## Model and state limits
 
-Facial Landmark mode uses MediaPipe Face Landmarker as a pre-label proposal. Its 478 mesh points are mapped from the official eye, eyebrow, nose and lip contours into the guideline's 50 IDs. This mapping passed one smoke inference and geometry validation, but has not been measured against reviewed ground truth. All points remain review-pending until checked.
+- MediaPipe returns a dense mesh, not the task's exact 50-point annotations. The contour mapping is a pending-review proposal and has no accuracy benchmark against reviewed ground truth.
+- MediaPipe has no per-point confidence or guideline Visible/Occluded state. Do not infer confidence values or mark fully hidden points Visible without evidence.
+- SCRFD/RetinaFace, RTMPose/MMPose and FAN are not installed. Current AI fallback uses MediaPipe retries only.
+- Rotation/mirror coordinate transforms are tested as helpers; the current UI does not offer arbitrary view rotation or automatic rotated inference.

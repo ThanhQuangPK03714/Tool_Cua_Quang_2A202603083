@@ -9,8 +9,11 @@ import sys
 from typing import Any, Sequence
 
 import numpy as np
+import cv2
 
 from src.guideline_annotation import SKELETONS
+from src.facial_landmark.coordinates import crop_face
+from src.facial_landmark.preprocessing import assess_image_quality, make_preprocessing_variants
 
 logger = logging.getLogger(__name__)
 MODEL_PATH = Path(__file__).resolve().parents[2] / "models" / "face_landmarker.task"
@@ -237,8 +240,13 @@ def propose_facial_landmark50(
     *,
     num_faces: int = 5,
     model_path: str | Path = MODEL_PATH,
+    face_roi: tuple[int, int, int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Detect face(s) and return 50-point proposal for the largest face."""
+    """Suggest guideline points, retrying conservative variants and scales.
+
+    An optional manual ROI crops the original image before inference. Returned
+    coordinates always refer to the original, unmodified image.
+    """
     try:
         import mediapipe as mp
     except ModuleNotFoundError as exc:
@@ -251,32 +259,108 @@ def propose_facial_landmark50(
 
     if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
         raise ValueError("Input must be a 3-channel RGB image")
+    image_rgb = np.ascontiguousarray(image_rgb, dtype=np.uint8)
     height, width = image_rgb.shape[:2]
+    quality = assess_image_quality(image_rgb)
     landmarker = _create_landmarker(str(Path(model_path).resolve()), int(num_faces))
-    try:
-        result = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(image_rgb)))
-    except Exception:
-        logger.exception("MediaPipe face inference failed image_size=%sx%s", width, height)
-        raise
-    faces = result.face_landmarks or []
-    if not faces:
-        return [], {"face_count": 0, "model": "MediaPipe Face Landmarker", "status": "no_face"}
+    offset_x = offset_y = 0
+    inference_image = image_rgb
+    if face_roi is not None:
+        inference_image, (offset_x, offset_y, _, _) = crop_face(image_rgb, face_roi, padding=0.18)
+    inference_quality = assess_image_quality(inference_image)
+    variants, _ = make_preprocessing_variants(
+        inference_image,
+        clahe_enabled=("low_contrast" in inference_quality["tags"] or "underexposed" in inference_quality["tags"]),
+        gamma_enabled=("low_light" in inference_quality["tags"]),
+        denoise_enabled=("high_noise" in inference_quality["tags"]),
+    )
+    attempts: list[dict[str, Any]] = []
+    candidate_inputs: list[tuple[str, np.ndarray, float, int, int]] = []
+    scales = (1.0, 1.5, 2.0) if min(inference_image.shape[:2]) < 720 else (1.0,)
+    for scale in scales:
+        resized = inference_image if scale == 1 else cv2.resize(
+            inference_image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+        )
+        candidate_inputs.append(("Original", resized, scale, 0, 0))
+    for name, variant in variants.items():
+        if name != "Original":
+            candidate_inputs.append((name, variant, 1.0, 0, 0))
 
-    def area(face: Sequence[Any]) -> float:
+    # Overlapping tiles are a last resort for a small, off-centre face.
+    if face_roi is None and min(inference_image.shape[:2]) >= 360:
+        tile_h = max(320, int(height * 0.72))
+        tile_w = max(320, int(width * 0.72))
+        step_x, step_y = max(1, int(tile_w * 0.62)), max(1, int(tile_h * 0.62))
+        xs = sorted(set([0, max(0, width - tile_w)] + list(range(0, max(1, width - tile_w + 1), step_x))))
+        ys = sorted(set([0, max(0, height - tile_h)] + list(range(0, max(1, height - tile_h + 1), step_y))))
+        for top in ys:
+            for left in xs:
+                if width <= tile_w and height <= tile_h:
+                    continue
+                tile = image_rgb[top:min(height, top + tile_h), left:min(width, left + tile_w)]
+                if tile.shape[0] >= 200 and tile.shape[1] >= 200:
+                    candidate_inputs.append((f"Original tile ({left},{top})", tile, 1.0, left, top))
+
+    def face_area(face: Sequence[Any]) -> float:
         xs = [float(point.x) for point in face]
         ys = [float(point.y) for point in face]
         return max(0.0, max(xs) - min(xs)) * max(0.0, max(ys) - min(ys))
 
-    chosen = max(faces, key=area)
-    shapes = map_mesh_to_facial_landmark50(chosen, width, height)
-    meta = {
-        "face_count": len(faces),
-        "selected_face": "largest_bbox",
+    for variant_name, candidate, scale, tile_x, tile_y in candidate_inputs:
+        try:
+            result = landmarker.detect(
+                mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(candidate))
+            )
+        except Exception:
+            logger.exception("MediaPipe inference failed variant=%s size=%s", variant_name, candidate.shape[:2])
+            attempts.append({"variant": variant_name, "scale": scale, "status": "inference_error"})
+            continue
+        faces = result.face_landmarks or []
+        attempts.append({"variant": variant_name, "scale": scale, "status": "face_detected" if faces else "no_face", "face_count": len(faces)})
+        if not faces:
+            continue
+        chosen = max(faces, key=face_area)
+        candidate_h, candidate_w = candidate.shape[:2]
+        shapes = map_mesh_to_facial_landmark50(chosen, candidate_w, candidate_h)
+        xs = [float(point.x) * candidate_w / scale + offset_x + tile_x for point in chosen]
+        ys = [float(point.y) * candidate_h / scale + offset_y + tile_y for point in chosen]
+        bbox = (
+            int(max(0, min(xs))), int(max(0, min(ys))),
+            int(min(width, max(xs)) - max(0, min(xs))),
+            int(min(height, max(ys)) - max(0, min(ys))),
+        )
+        selected_quality = assess_image_quality(image_rgb, bbox)
+        for shape in shapes:
+            for point in shape["points"]:
+                point["x"] = float(point["x"]) / scale + offset_x + tile_x
+                point["y"] = float(point["y"]) / scale + offset_y + tile_y
+                point["model_version"] = getattr(mp, "__version__", "unknown")
+        meta = {
+            "face_count": len(faces),
+            "selected_face": "largest_bbox",
+            "model": "MediaPipe Face Landmarker",
+            "model_version": getattr(mp, "__version__", "unknown"),
+            "native_landmarks": len(chosen),
+            "mapping": "guideline-v1-media-mesh-contours",
+            "review_status": "pending",
+            "status": "face_detected",
+            "selected_variant": variant_name,
+            "selected_scale": scale,
+            "quality": selected_quality,
+            "face_bbox": bbox,
+            "attempts": attempts,
+            "face_roi": face_roi,
+        }
+        if len(faces) > 1:
+            meta["warning"] = "Nhiều mặt được phát hiện; app đã chọn mặt lớn nhất, hãy xác nhận đây là người lái."
+        return shapes, meta
+    failed_status = "inference_failed" if attempts and all(item["status"] == "inference_error" for item in attempts) else "detection_failed"
+    return [], {
+        "face_count": 0,
         "model": "MediaPipe Face Landmarker",
-        "native_landmarks": len(chosen),
-        "mapping": "guideline-v1-media-mesh-contours",
-        "review_status": "pending",
+        "model_version": getattr(mp, "__version__", "unknown"),
+        "status": failed_status,
+        "quality": quality,
+        "attempts": attempts,
+        "warning": "Không tìm thấy mặt qua ảnh gốc, các mức phóng và biến thể tiền xử lý. Vẫn có thể chọn vùng mặt và gán landmark thủ công.",
     }
-    if len(faces) > 1:
-        meta["warning"] = "Nhiều mặt được phát hiện; app đã chọn mặt lớn nhất, hãy xác nhận đây là người lái."
-    return shapes, meta

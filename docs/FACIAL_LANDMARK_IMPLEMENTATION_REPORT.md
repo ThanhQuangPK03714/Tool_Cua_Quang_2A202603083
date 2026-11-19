@@ -1,53 +1,57 @@
 # Facial Landmark Implementation Report
 
-Status: **PARTIALLY COMPLETED**
+Report date: 2026-11-19
 
-Report date: 2026-11-18
+Status: **Partially completed.** Priority 1 manual fallback and core image-quality/preprocessing support are implemented. The requested six-file real-image evaluation and several model integrations are blocked or not implemented; see the sample report and benchmark.
 
 ## Completed
 
-- Audited the current Streamlit, Canvas v2, guideline, CVAT client and segmentation inference paths; see `FACIAL_LANDMARK_AUDIT.md`.
-- Confirmed the seven parent group names, global ID ranges, counts and open/closed contours against the pasted guideline.
-- Added per-ID anatomical placement cues to the manual canvas and prevented segmentation inference from being used on the exact Facial Landmark-50 label set.
-- Added user-facing explanation that mask segmentation does not output facial skeleton/keypoints.
-- Added tests for the seven-label task detector and placement cue coverage.
-- Added a connected CVAT Job workspace with strict parent/child/Point-ID validation, SVG topology verification when available, per-point visibility, append-or-update by group and server read-back verification.
-- Added tests for CVAT skeleton serialization, point states/IDs, topology rejection, create/update behavior and preservation of unrelated shapes.
-- Added a connected CVAT Job workspace that loads the frame from CVAT, supports per-point state and coordinate review, requires acceptance of all 50 points, and writes only after a separate save confirmation.
-- Added label-detail hydration for skeleton labels when the compact Task payload omits the SVG; preflight then validates the fetched skeleton graph.
-- Changed missing/invalid SVG from a hard stop to a visible warning when all child Point IDs map explicitly. The app uses guideline contours and logs malformed SVG details so annotation is not blocked by the CVAT label-list response.
-- Added parsing for CVAT SVG payloads containing multiple XML roots, draft validation from 0/50, and a one-click MediaPipe Face Landmarker proposal for all 50 points on the selected frame.
+- Kept the seven guideline groups and Point IDs unchanged.
+- Added `src/facial_landmark/preprocessing/` with image-quality metrics, grayscale-appearance tags, CLAHE, gamma correction, bilateral/NL-means/Gaussian denoising helpers, sharpening, and dimension-preserving variants.
+- Added image-space coordinate helpers for 0/90/180/270-degree rotations, inverse point transforms, horizontal mirror transforms, padded/clamped face crops, and ROI validation.
+- Added quality display and Original/CLAHE/Gamma/Denoised preview controls to the local Facial Landmark-50 workspace. Enhanced images keep the source dimensions; saved landmark coordinates remain in original-image coordinates.
+- Added manual Face Instance ROI drawing, ROI zoom, multiple local instances, instance-specific skeleton progress, point deletion with stable IDs, drag/edit state, undo/redo, JSON persistence, and import/export of face regions.
+- The connected CVAT Job workspace can also draw and zoom a manual face ROI. AI inference accepts that crop; the annotation canvas remains usable if detection fails.
+- MediaPipe retries the original, modest upscales, quality-selected preprocessing variants, and overlapping tiles. A manual ROI runs on a padded crop; output coordinates are mapped back to the original frame.
+- AI merge refreshes pending AI points while retaining manual/imported/accepted/saved points. Failed inference leaves existing work in place and displays a manual-continuation message.
+- Added `face_instance_id` support in local draft validation and persistence. Multiple local Face Instances keep independent 50-point groups.
+- Added structured missing-sample instructions under `tests/fixtures/facial_landmark/driver_monitoring/` without creating substitute images.
+- Updated user, audit, benchmark, and sample-test reports to distinguish implemented behavior from unavailable evidence.
 
 ## Partially completed
 
-- **Manual annotation**: the existing standalone Canvas local workflow remains separate. A connected CVAT Job workspace now loads CVAT images and saves a one-face seven-skeleton group after review. Multiple face instances, point-level deletion, complete keyboard workflows and full zoom/pan controls are not implemented.
-- **CVAT**: append/update and server read-back are implemented for a preflight-compatible one-face group. Unit tests use a mock client; the user's actual Task taxonomy and server behavior remain unverified because no authenticated live CVAT Task/Job was available.
+- MediaPipe is the only installed landmark model. The current mapping proposes a full guideline-ordered 50 points when it receives a mesh; partial-mesh mapping is not implemented.
+- Multiple Face Instances work in Canvas local. The connected CVAT workspace remains a single-face editor because its current CVAT serializer saves one seven-skeleton group per frame.
+- Rotation and mirror inverse transforms have unit tests. The UI does not yet rotate the displayed view or run inference on rotated candidates.
+- Enhancement functions include NL-means and sharpening, but the UI exposes CLAHE, gamma, and bilateral denoising controls only.
+- Canvas v2 starts and the app's Canvas local route renders. A real image upload and drag interaction could not be visually driven because the sample files are unavailable to the workspace and the Agent API does not accept file-uploader actions.
+- Existing CVAT conversion and read-back code has mock-client tests. No live CVAT Task/Job was connected during this work.
 
 ## Not implemented
 
-- RTMPose and FAN inference.
-- Benchmark-verified accuracy for the MediaPipe-to-50 mapping; only a smoke inference and guideline geometry check were performed.
-- Model comparison, confidence-based review, multi-face AI, model registry, ONNX deployment and active learning.
-- Multiple Face Instance editing and benchmark metrics.
+- SCRFD, RetinaFace, YOLO-face, RTMPose/MMPose, FAN, an inference registry, and per-model mapping configuration.
+- Per-point confidence, automatic occlusion classification, verified partial 50-point prediction, custom model training, active learning, and temporal video tracking.
+- Camera undistortion or automatic 90/180/270-degree inference. No camera calibration is available, so no distortion correction is guessed.
 
 ## Blocked by environment/data
 
-- No authenticated live CVAT Task/Job is available to inspect or write/read back.
-- No reviewed Facial Landmark-50 ground truth is present, so mapping accuracy, NME/PCK and speed cannot be certified.
-- No representative reviewed ground truth is available to certify the mapping accuracy. MediaPipe does not return per-point confidence or the guideline's Visible/Occluded state.
-- The source repository contains no DOCX/PDF guideline; this implementation uses the pasted guideline text and cannot verify unseen diagrams.
+- The six named PNG originals are not accessible under `/mnt/data` or the Windows workspace. Four inline previews appeared in chat, but they are not readable as image files from this process. Samples 5 and 6 are not present as files either.
+- No reviewed Facial Landmark-50 ground truth was supplied. No NME/PCK or accuracy claim is made.
+- No authenticated live CVAT Job was available for actual Task taxonomy, write, or read-back verification.
 
-## Tests observed
+## Verification performed
 
-- `pytest tests -q`: 28 passed, 5 skipped (2026-11-18).
-- `py_compile` for the changed app and guideline module passed.
-- `node --check` on the embedded Canvas JavaScript passed.
-- Streamlit app startup and navigation into Facial Landmark-50 passed using the local agent API.
-- The full root-level pytest collection is blocked by `test_integration.py`, which raises unless CVAT credentials are configured. No credentials were read or added.
+- `python -m pytest tests -q`: 40 passed, 5 skipped.
+- Streamlit Agent API: headless app health `ok`; app reached `ready`; navigation to Canvas local / Facial Landmark-50 rendered without a script exception.
+- App console was checked after reruns; the repeated component-registration warning was fixed by caching/versioning the inline Canvas v2 registrations.
+- The manual Canvas could not be exercised against the provided sample images until their original files are placed in the fixture folder.
 
-## References
+## Files added or updated
 
-- CVAT skeleton manual annotation: https://docs.cvat.ai/docs/annotation/manual-annotation/shapes/skeletons/
-- CVAT Job API: https://docs.cvat.ai/docs/api_sdk/sdk/reference/apis/jobs-api/
-- MediaPipe Face Landmarker: https://developers.google.com/edge/mediapipe/solutions/vision/face_landmarker
-- MMPose: https://github.com/open-mmlab/mmpose
+- `src/facial_landmark/preprocessing/` — image assessment and enhancement helpers.
+- `src/facial_landmark/coordinates.py` — rotation, mirror, crop, and ROI transforms.
+- `src/facial_landmark/annotation_state.py` — merge AI suggestions without replacing reviewed work.
+- `src/facial_landmark/mp_face_landmarker.py` — preprocessing, scale/tile retries, manual ROI and inverse coordinate offsets.
+- `src/guideline_annotation.py` and `app.py` — multi-instance manual canvas, persistence, preview, connected ROI, and review merge.
+- `tests/test_facial_preprocessing.py` and focused facial guideline/model tests.
+- `docs/DRIVER_MONITORING_IMAGE_TEST_REPORT.md` and refreshed Facial Landmark reports.

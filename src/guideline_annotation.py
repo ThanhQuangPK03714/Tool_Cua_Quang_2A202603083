@@ -206,6 +206,24 @@ def validate_facial(
     *,
     allow_incomplete: bool = False,
 ) -> list[str]:
+    if any("face_instance_id" in shape for shape in shapes):
+        instances: dict[str, list[Mapping[str, Any]]] = {}
+        for shape in shapes:
+            instance_id = str(shape.get("face_instance_id") or "face-01")
+            instances.setdefault(instance_id, []).append(
+                {key: value for key, value in shape.items() if key != "face_instance_id"}
+            )
+        issues = []
+        for instance_id, instance_shapes in instances.items():
+            instance_issues = validate_facial(
+                instance_shapes, width, height, allow_incomplete=allow_incomplete
+            )
+            issues.extend(
+                f"{instance_id}: {message}" if len(instances) > 1 else message
+                for message in instance_issues
+            )
+        return issues
+
     issues: list[str] = []
     by_name: dict[str, Mapping[str, Any]] = {}
     seen_ids: set[int] = set()
@@ -223,7 +241,11 @@ def validate_facial(
         points = shape.get("points") or []
         ids = [point.get("id") for point in points]
         expected_ids = list(range(spec["start"], spec["start"] + spec["count"]))
-        valid_draft_ids = len(ids) <= len(expected_ids) and ids == expected_ids[:len(ids)]
+        valid_draft_ids = (
+            len(ids) <= len(expected_ids)
+            and all(isinstance(point_id, int) and point_id in expected_ids for point_id in ids)
+            and ids == sorted(set(ids))
+        )
         if (allow_incomplete and not valid_draft_ids) or (not allow_incomplete and ids != expected_ids):
             issues.append(f"{name}: expected Point IDs {expected_ids[0]}–{expected_ids[-1]} in order")
         for point in points:
@@ -278,10 +300,20 @@ def validate_facial(
     return issues
 
 
-def save_annotation_file(path: str | Path, image_record: Mapping[str, Any], mode: str, annotations: list[Mapping[str, Any]], issues: list[Mapping[str, str]] | None = None) -> None:
+def save_annotation_file(
+    path: str | Path,
+    image_record: Mapping[str, Any],
+    mode: str,
+    annotations: list[Mapping[str, Any]],
+    issues: list[Mapping[str, str]] | None = None,
+    *,
+    face_regions: list[Mapping[str, Any]] | None = None,
+) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {"schema_version": 1, "mode": mode, "image": {"key": image_record["key"], "name": image_record["name"], "width": int(image_record["width"]), "height": int(image_record["height"])}, "annotations": export_annotations(annotations), "issues": issues or []}
+    if face_regions is not None:
+        payload["face_regions"] = copy.deepcopy(face_regions)
     temp = target.with_suffix(target.suffix + ".tmp")
     temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temp.replace(target)
@@ -305,6 +337,31 @@ def load_annotation_file(data: bytes, image_record: Mapping[str, Any], mode: str
             if "state" not in point and ("outside" in point or "occluded" in point):
                 point["state"] = flags_point_state(bool(point.get("outside")), bool(point.get("occluded")))
     return restored
+
+
+def load_face_regions(data: bytes, image_record: Mapping[str, Any], mode: str) -> list[dict[str, Any]]:
+    """Load optional manual face ROIs while validating the owning annotation file."""
+    load_annotation_file(data, image_record, mode)
+    payload = json.loads(data.decode("utf-8"))
+    regions = payload.get("face_regions", [])
+    if not isinstance(regions, list):
+        raise ValueError("Invalid face region list")
+    cleaned = []
+    seen_ids = set()
+    for region in regions:
+        if not isinstance(region, Mapping):
+            raise ValueError("Invalid face region")
+        region_id = str(region.get("id", ""))
+        x, y, width, height = (float(region.get(key, 0)) for key in ("x", "y", "width", "height"))
+        if not region_id or region_id in seen_ids or width <= 0 or height <= 0:
+            raise ValueError("Invalid or duplicate face region")
+        if not all(math.isfinite(value) for value in (x, y, width, height)):
+            raise ValueError("Face region coordinates must be finite")
+        if x < 0 or y < 0 or x + width > int(image_record["width"]) or y + height > int(image_record["height"]):
+            raise ValueError("Face region must stay within the source image")
+        seen_ids.add(region_id)
+        cleaned.append({"id": region_id, "x": x, "y": y, "width": width, "height": height})
+    return cleaned
 
 
 def export_annotations(annotations: list[Mapping[str, Any]]) -> list[dict[str, Any]]:

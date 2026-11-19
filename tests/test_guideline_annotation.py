@@ -12,6 +12,7 @@ from src.guideline_annotation import (
     flags_point_state,
     has_self_intersection,
     load_annotation_file,
+    load_face_regions,
     point_state_flags,
     save_annotation_file,
     validate_street,
@@ -86,6 +87,17 @@ def test_annotation_json_round_trip():
         assert restored[0]["points"][0]["occluded"] is False
 
 
+def test_annotation_json_round_trips_manual_face_regions():
+    image = {"key": "image-key", "name": "face.jpg", "width": 40, "height": 30}
+    region = {"id": "face-01", "x": 3, "y": 4, "width": 20, "height": 18}
+    with TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+        path = Path(temp_dir) / "annotation.json"
+        save_annotation_file(path, image, "Facial Landmark-50", [], face_regions=[region])
+        assert load_face_regions(path.read_bytes(), image, "Facial Landmark-50") == [
+            {"id": "face-01", "x": 3.0, "y": 4.0, "width": 20.0, "height": 18.0}
+        ]
+
+
 def test_json_export_uses_cvat_native_keypoint_flags():
     points = [{"id": 0, "x": 1, "y": 2, "state": "Outside"}, {"id": 1, "x": 3, "y": 4, "state": "Occluded"}]
     exported = export_annotations([{"type": "skeleton", "label": "longmaytrai", "points": points}])
@@ -133,3 +145,27 @@ def test_facial_validator_allows_an_empty_or_partial_connected_job_draft():
     }]
     assert validate_facial(partial, 100, 100, allow_incomplete=True) == []
     assert any("Missing skeleton" in error for error in validate_facial(partial, 100, 100))
+
+
+def test_facial_validator_accepts_multiple_face_instances_independently():
+    shape = {
+        "type": "skeleton", "label": "longmaytrai", "contour": "open",
+        "points": [{"id": i, "x": i + 10, "y": i + 10, "state": "Visible"} for i in range(5)],
+    }
+    first = {**shape, "points": [dict(point) for point in shape["points"]]}
+    second = {**shape, "points": [dict(point, x=point["x"] + 30) for point in shape["points"]]}
+    first["face_instance_id"] = "face-01"
+    second["face_instance_id"] = "face-02"
+    issues = validate_facial([first, second], 100, 100, allow_incomplete=True)
+    assert issues == []
+
+
+def test_facial_validator_allows_deleted_point_gap_in_incomplete_draft():
+    partial = [{
+        "type": "skeleton", "label": "longmaytrai", "contour": "open",
+        "points": [
+            {"id": 0, "x": 5.0, "y": 5.0, "state": "Visible"},
+            {"id": 2, "x": 15.0, "y": 5.0, "state": "Visible"},
+        ],
+    }]
+    assert validate_facial(partial, 100, 100, allow_incomplete=True) == []
