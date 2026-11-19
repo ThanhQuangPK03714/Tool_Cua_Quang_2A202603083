@@ -5,6 +5,7 @@ import functools
 import logging
 import math
 from pathlib import Path
+import sys
 from typing import Any, Sequence
 
 import numpy as np
@@ -154,8 +155,11 @@ def map_mesh_to_facial_landmark50(
         eyebrow_candidates.append((sum(xs) / len(xs), curve))
     eyebrow_candidates.sort(key=lambda item: item[0])
     for label, (_, curve) in zip(("longmaytrai", "longmayphai"), eyebrow_candidates):
-        ascending = label == "longmayphai"
-        curve = _orient_by_x(curve, landmarks, width, height, ascending=ascending)
+        # Point IDs follow the image-side guideline: left brow 0→4 runs
+        # from the outer tail toward the inner head; right brow 5→9 runs
+        # from the inner head toward the outer tail. Both move left-to-right
+        # in image coordinates.
+        curve = _orient_by_x(curve, landmarks, width, height, ascending=True)
         spec = next(item for item in SKELETONS if item["name"] == label)
         coords = [_sample_arc(curve, landmarks, width, height, f) for f in (0, .25, .5, .75, 1)]
         shapes.append(_shape_from_coords(label, spec, coords, width, height))
@@ -235,7 +239,15 @@ def propose_facial_landmark50(
     model_path: str | Path = MODEL_PATH,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Detect face(s) and return 50-point proposal for the largest face."""
-    import mediapipe as mp
+    try:
+        import mediapipe as mp
+    except ModuleNotFoundError as exc:
+        if exc.name != "mediapipe":
+            raise
+        raise RuntimeError(
+            "Python đang chạy Streamlit chưa có MediaPipe "
+            f"({sys.executable}). Chạy setup_facial_landmark.ps1 với -PythonExe trỏ tới Python này."
+        ) from exc
 
     if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
         raise ValueError("Input must be a 3-channel RGB image")

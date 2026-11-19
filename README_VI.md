@@ -94,7 +94,7 @@ Trước khi gửi, kiểm tra preview và xác nhận lại sau mỗi lần đ�
 
 ### Facial Landmark-50 trực tiếp trên CVAT Job
 
-Nếu chưa có model auto-label, chạy một lần `powershell -ExecutionPolicy Bypass -File .\setup_facial_landmark.ps1` trong môi trường app.
+Nếu chưa có model auto-label, chạy một lần `powershell -ExecutionPolicy Bypass -File .\setup_facial_landmark.ps1`. Mặc định script cài MediaPipe vào Python đang có trên `PATH`, nên hãy chạy cùng môi trường dùng để mở Streamlit. Nếu mở app bằng `run_gpu.ps1`, cài vào đúng môi trường GPU bằng `powershell -ExecutionPolicy Bypass -File .\setup_facial_landmark.ps1 -PythonExe .venv-sam3\Scripts\python.exe`.
 
 Khi Task có đúng 7 label Facial Landmark-50, app chuyển khỏi luồng segmentation sang workspace **Facial Landmark-50 · CVAT Job**. Chọn frame, bấm **AI tự gán 50 điểm cho frame**, duyệt pre-label rồi xác nhận **Save to CVAT**. App dùng MediaPipe Face Landmarker, lưu nháp với trạng thái review pending, và chỉ ghi/cập nhật nhóm skeleton của frame đang chọn; shape/tag/track khác được giữ nguyên, sau đó app đọc lại để xác nhận.
 

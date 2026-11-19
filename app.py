@@ -3208,38 +3208,27 @@ def render_cvat_facial_workspace(ctx: Dict[str, Any], client: CVATClient) -> Non
             point.setdefault("review_status", "pending")
 
     ai_meta_key = f"{state_key}_ai_metadata"
-    ai_col, replace_col = st.columns([2, 3])
-    with replace_col:
-        replace_draft = st.checkbox(
-            "Thay bản nháp hiện tại bằng kết quả AI",
-            value=False,
-            disabled=not bool(annotations),
-            key=f"{image_key}_replace_ai_draft",
-        )
-    with ai_col:
-        if st.button("AI tự gán 50 điểm cho frame", type="primary", key=f"{image_key}_auto_label"):
-            if annotations and not replace_draft:
-                st.warning("Frame đã có bản nháp. Chọn thay bản nháp nếu muốn chạy lại AI.")
+    st.info("Bấm chạy AI sẽ tạo lại đề xuất và thay bản nháp hiện tại của frame này nếu phát hiện được mặt.")
+    if st.button("AI tự gán 50 điểm cho frame", type="primary", key=f"{image_key}_auto_label"):
+        try:
+            with st.spinner("MediaPipe đang phát hiện mặt và đề xuất 50 landmark…"):
+                proposed, ai_meta = facial_mp_module.propose_facial_landmark50(
+                    np.asarray(image.convert("RGB")),
+                )
+            if not proposed:
+                st.warning("Không phát hiện được mặt trong frame này; không ghi annotation.")
             else:
-                try:
-                    with st.spinner("MediaPipe đang phát hiện mặt và đề xuất 50 landmark…"):
-                        proposed, ai_meta = facial_mp_module.propose_facial_landmark50(
-                            np.asarray(image.convert("RGB")),
-                        )
-                    if not proposed:
-                        st.warning("Không phát hiện được mặt trong frame này; không ghi annotation.")
-                    else:
-                        annotations[:] = proposed
-                        st.session_state[state_key] = annotations
-                        st.session_state[ai_meta_key] = ai_meta
-                        save_annotation_file(storage, record, "Facial Landmark-50", annotations)
-                        st.rerun()
-                except Exception as exc:
-                    logger.exception(
-                        "Facial landmark auto-label failed task=%s job=%s frame=%s",
-                        ctx.get("task_id"), ctx.get("job_id"), frame_number_value,
-                    )
-                    st.error(f"AI auto-label thất bại: {type(exc).__name__}: {exc}")
+                annotations[:] = proposed
+                st.session_state[state_key] = annotations
+                st.session_state[ai_meta_key] = ai_meta
+                save_annotation_file(storage, record, "Facial Landmark-50", annotations)
+                st.rerun()
+        except Exception as exc:
+            logger.exception(
+                "Facial landmark auto-label failed task=%s job=%s frame=%s",
+                ctx.get("task_id"), ctx.get("job_id"), frame_number_value,
+            )
+            st.error(f"AI auto-label thất bại: {type(exc).__name__}: {exc}")
     ai_meta = st.session_state.get(ai_meta_key)
     if ai_meta:
         st.caption(

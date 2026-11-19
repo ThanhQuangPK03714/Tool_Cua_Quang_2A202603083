@@ -1,11 +1,14 @@
 param(
-    [string]$PythonExe = ".venv-sam3\Scripts\python.exe"
+    [string]$PythonExe = ""
 )
 
-$pythonPath = if ([System.IO.Path]::IsPathRooted($PythonExe)) {
-    $PythonExe
+if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+    $pythonCommand = Get-Command python -ErrorAction Stop
+    $pythonPath = $pythonCommand.Source
+} elseif ([System.IO.Path]::IsPathRooted($PythonExe)) {
+    $pythonPath = $PythonExe
 } else {
-    Join-Path $PSScriptRoot $PythonExe
+    $pythonPath = Join-Path $PSScriptRoot $PythonExe
 }
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Python executable not found: $pythonPath"
@@ -25,3 +28,4 @@ if (-not (Test-Path -LiteralPath $modelPath)) {
         -OutFile $modelPath
 }
 Write-Host "Facial Landmark model ready: $modelPath"
+Write-Host "Installed MediaPipe into: $pythonPath"
