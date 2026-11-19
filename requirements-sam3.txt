@@ -1,0 +1,2 @@
+# Optional dependency used by SAM 3 text and visual-exemplar prompts.
+git+https://github.com/ultralytics/CLIP.git

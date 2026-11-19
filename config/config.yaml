@@ -1,0 +1,46 @@
+﻿# Cấu hình công cụ tự động gán nhãn segmentation
+cvat:
+  default_environment: "local"
+  server_url: "http://localhost:8080"
+  local_url: "http://localhost:8080"
+  online_url: "https://cvat.edufun.ai"
+  preferred_auth: "personal_access_token"
+  session_auth_supported: true
+
+models:
+  device: "auto"
+  yolo:
+    weights_env: "YOLO_WEIGHTS"
+    default_weights: "yolov8n-seg.pt"
+    confidence_threshold: 0.25
+  sam3:
+    weights_env: "SAM3_WEIGHTS"
+    optional: true
+    requires_cuda: true
+  semantic:
+    name: "nvidia/segformer-b0-finetuned-cityscapes-1024-1024"
+    input_size: [512, 512]
+    confidence_threshold: 0.25
+  instance:
+    name: "yolov8n-seg"
+    weights: "yolov8n-seg.pt"
+    input_size: [640, 640]
+    confidence_threshold: 0.25
+    iou_threshold: 0.45
+  panoptic:
+    name: "combined"
+    stuff_model: "segformer_cityscapes"
+    thing_model: "yolov8n-seg"
+
+qc:
+  min_mask_area: 100
+  max_mask_area_ratio: 0.9
+  min_confidence_high: 0.7
+  min_confidence_medium: 0.4
+  overlap_threshold: 0.3
+  hole_fill_threshold: 0.1
+
+ui:
+  title: "Công cụ AI tự động gán nhãn Image Segmentation (CVAT Local)"
+  layout: "wide"
+
